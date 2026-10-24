@@ -134,6 +134,7 @@ DATAFORSEO_SANDBOX=                       # any value routes to the free sandbox
 LINKEDIN_EMAIL=  LINKEDIN_PASSWORD=   # LinkedIn prospecting
 CLOUDFLARE_ACCOUNT_ID=  CLOUDFLARE_API_TOKEN=   # deep JS crawling for training
 SERPER_API_KEY=            # web search + discovery (2,500 free, then a $50 prepaid pack)
+PRECLEARED_API_KEY=        # only with compliance.precleared on; free key at precleared.dev/get-key
 ```
 
 **Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in franco.yaml, put the OAuth client id/secret in `.env`, then run `franco gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
@@ -241,7 +242,7 @@ These go in `franco.yaml` under `usage:`. Use sensible defaults unless they want
 - `quiet_hours`: 22:00-07:00 in their timezone
 - `max_daily_sends`: 50 (email send limit)
 
-**Compliance: ask for this, never guess it.** Ask for the user's physical business postal address and put it in `compliance.postal_address`. The template ships with `require_footer: true`, so no cold email sends until it is set. Their real settings belong in `franco.local.yaml` (gitignored; it replaces `franco.yaml` when present). Never put another person's or company's address in a user's footer. Also ask whether there are claims their emails must never make; those go in `compliance.blocked_claims`.
+**Compliance: ask for this, never guess it.** Ask for the user's physical business postal address and put it in `compliance.postal_address`. The template ships with `require_footer: true`, so no cold email sends until it is set. Their real settings belong in `franco.local.yaml` (gitignored; it replaces `franco.yaml` when present). Never put another person's or company's address in a user's footer. Also ask whether there are claims their emails must never make; those go in `compliance.blocked_claims`. `compliance.precleared` is an optional per-recipient check before the first cold email (see README); it is off by default. If they turn it on, ask where their business is based (`sender_country`: GB, US or AE) and where their addresses come from (`address_source`); never guess either.
 
 **Outreach mode:** ask how they want emails produced: generated (default), approved copy (`templates`), or `raad` (funnels). For approved copy or raad, help them write `outreach.campaigns` or `outreach.funnels` (see README), and explain the preview and sign-off before their first batch.
 
@@ -337,4 +338,5 @@ franco sending pause|resume  # Kill switch for all outbound
 - **Claude headless mode fails**: User needs `claude login` and an active Max subscription
 - **Codex calls fail** (`brain.provider: codex`): the log line says why — `codex login` with ChatGPT (also when the login "has expired or is due for renewal": Franco never renews it), install the supported Codex version (`franco status --check` shows what's wrong without a model call; while Codex is unusable Franco pauses whole cycles on purpose), pick a `brain.model` without code mode, or remove whatever Codex config layer is forcing tools/hooks/MCP back on. Never weaken Franco's isolation checks to get past it.
 - **Instantly API 401**: Wrong API key or needs the Growth plan for API access
+- **Cold email held with "compliance check unavailable"** (`compliance.precleared` on): the log line says why. Without a key Precleared allows only a few checks a day, so add a free `PRECLEARED_API_KEY` or wait until tomorrow; a rejected key or a network problem holds it the same way. Replies still send.
 - **Google search rate limiting**: Franco automatically falls back to DuckDuckGo and Bing. For reliable search, add a Serper API key ($5/mo).
