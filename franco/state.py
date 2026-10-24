@@ -909,6 +909,7 @@ class StateManager:
         status: str | None = None,
         due_before: str | None = None,
         limit: int = 200,
+        exclude_kind: str | None = None,
     ) -> list[dict]:
         where, params = [], []
         if status:
@@ -917,6 +918,9 @@ class StateManager:
         if due_before:
             where.append("(send_at IS NULL OR send_at <= ?)")
             params.append(due_before)
+        if exclude_kind:
+            where.append("kind != ?")
+            params.append(exclude_kind)
         sql = "SELECT * FROM outbox"
         if where:
             sql += " WHERE " + " AND ".join(where)
