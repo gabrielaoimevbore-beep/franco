@@ -1,30 +1,48 @@
 """Optional per-recipient cold-email check through Precleared (precleared.dev).
 
-Off by default. With ``compliance.precleared.enabled: true``, the sender asks
-Precleared about each recipient before the first cold email of a sequence:
-may a cold marketing email go to this address under the rules of the
-recipient's country (UK PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and
-others)? Those rules turn on facts the address doesn't show, such as whether
-a UK recipient is a limited company or a sole trader, so Precleared looks
-them up. Anything other than ``ok_to_email`` stops the email, with the rule
-and the next step, and the signed receipt id is logged with the send so the
-decision can be shown later.
+Off by default. With ``compliance.precleared.enabled: true``, Franco asks
+Precleared about each recipient before their first cold email: may a cold
+marketing email go to this address under the rules of the recipient's
+country (UK PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and others)?
+Those rules turn on facts the address doesn't show, such as whether a UK
+recipient is a limited company or a sole trader, so Precleared looks them up.
 
-One check per address: a definite verdict is cached in the settings table for
-CACHE_DAYS, together with a fingerprint of everything sent with the address
-(sender country, address source, product description and, if set, prospect
-country). A cached verdict is reused only while those are unchanged, so a
-three-step sequence costs one check but a config change forces a fresh one.
-Replies are never checked. Precleared receives the recipient's address, your
-sender country, the address source you configure, the first 200 characters of
-your product description (used to judge relevance under CASL and French
-rules) and, if you set one, your prospects' country, which it uses only when
-it can't work out the recipient's country from the address, company records
-or the company's website.
+Sending never waits on Precleared. A cold email is sent only on a verdict
+already stored for its address. An address without one is checked after that
+cycle's sending is done, and its email is decided on the next cycle, when
+every other pre-send check runs again on fresh data. ``ok_to_email`` lets the
+email go, and the signed receipt id is logged with the send so the decision
+can be shown later. Any other verdict stops the email, with the rule and the
+next step; ``unknown`` (a fact Precleared needed couldn't be established)
+counts as consent needed, as Precleared advises.
+
+Verdicts are stored in the settings table as ``precleared:<address>`` rows,
+with a fingerprint of everything sent with the address (sender country,
+address source, product description and, if set, prospect country). A stored
+verdict is used only while those are unchanged, for CACHE_DAYS
+(UNKNOWN_CACHE_DAYS for ``unknown``), so a three-step sequence costs one
+check but a config change forces a fresh one. A cold email with no current
+verdict waits for a check whatever its step (after a config change, when the
+verdict has expired, or when the check is switched on mid-sequence), and a
+stopping verdict then ends that sequence like any other failed step. A newer
+verdict replaces the row; rows are never deleted automatically. Replies are
+never checked.
+
+Precleared receives the recipient's address, your sender country, the address
+source you configure, the first 200 characters of your product description
+(used to judge relevance under CASL and French rules) and, if you set one,
+your prospects' country, which it uses only when it can't work out the
+recipient's country from the address, company records or the company's
+website.
 
 A check that doesn't produce a verdict (network trouble, daily allowance used
-up, a rate limit, a rejected key, a malformed answer) holds cold email for a
-later cycle instead of failing it. Replies still go out.
+up, a rate limit, a rejected key, a server error, a malformed answer) leaves
+the email waiting for a later cycle instead of failing it.
+
+``ok_to_email`` assumes the email carries a compliant footer: who you are, a
+postal address and a way to opt out. Franco doesn't read the ``footer_text``
+Precleared returns; it relies on its own footer, so cold email is held while
+the check is on and ``compliance.require_footer`` is off.
 
 Without an API key Precleared allows a few checks a day per IP address; a free
 key (https://precleared.dev/get-key, PRECLEARED_API_KEY) gives this install its
@@ -32,6 +50,7 @@ own daily allowance. Beyond the free allowance, checks are paid
 (https://precleared.dev/buy).
 """
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -47,13 +66,18 @@ GET_KEY_URL = "https://precleared.dev/get-key"
 # Precleared answers within 25 seconds (with verdict "unknown" if a register
 # lookup is slow), so the read timeout sits just above that.
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+# httpx's read timeout applies to each chunk, so an answer that trickles in
+# could outlast it; this bounds the whole request.
+TOTAL_TIMEOUT = 40.0
 CACHE_DAYS = 30
+# "unknown" can be temporary (a slow company register), so it is kept only
+# long enough for other emails to the same address not to ask again at once.
+UNKNOWN_CACHE_DAYS = 1
 # Bump when the facts in _facts change meaning, so older cache entries are
 # ignored rather than reused.
 CACHE_VERSION = 1
 SETTINGS_PREFIX = "precleared:"
 VERDICTS = {"ok_to_email", "consent_needed", "blocked", "unknown"}
-DEFINITE_VERDICTS = {"ok_to_email", "consent_needed", "blocked"}
 USER_AGENT = "franco (+https://github.com/GortexAI/franco)"
 
 
@@ -61,14 +85,18 @@ USER_AGENT = "franco (+https://github.com/GortexAI/franco)"
 class Clearance:
     """Precleared's answer for one address.
 
-    ``allowed``: send it. ``held``: the check could not be made right now
-    (network trouble, daily allowance used up, rate limit, rejected key,
-    malformed answer), so the email stays queued and is tried again on a later
-    cycle. Otherwise the email is stopped and ``reason`` says why.
+    ``allowed``: send it. ``held``: no verdict right now (network trouble,
+    allowance used up, rate limit, rejected key, server error, malformed
+    answer), so the email waits for a later cycle. ``pause_checks``: the
+    failure is most likely not about this address (no connection or no
+    answer in time, allowance used up, rate limit, rejected key, an answer
+    Franco can't read), so no more checks are tried this cycle. Otherwise
+    the email is stopped and ``reason`` says why.
     """
 
     allowed: bool
     held: bool = False
+    pause_checks: bool = False
     verdict: str = ""
     reason: str = ""
     receipt_id: str = ""
@@ -134,20 +162,20 @@ class PreclearedClient:
 
     async def cached(self, to_email: str, state) -> Clearance | None:
         """The stored verdict for this address and these facts, or None."""
-        raw = await state.get_setting(SETTINGS_PREFIX + _address(to_email))
+        raw = await state.get_setting(SETTINGS_PREFIX + normalize_address(to_email))
         return _from_cache(raw, self._fingerprint())
 
     async def check(self, to_email: str, state) -> Clearance:
-        """Ask Precleared now, and store a definite verdict for next time."""
-        email = _address(to_email)
+        """Ask Precleared now, and store the verdict for next time."""
+        email = normalize_address(to_email)
         try:
             result = await self._check(email)
         except Exception as e:
-            # Whatever went wrong, an unfinished check holds cold email; it
-            # never stops the cycle.
+            # A failure nobody planned for holds just this address's email,
+            # to be asked about again on a later cycle.
             return Clearance(allowed=False, held=True, reason=self._redact(
                 f"Precleared check failed ({type(e).__name__}: {e})")[:240])
-        if not result.held and result.verdict in DEFINITE_VERDICTS:
+        if not result.held:
             # One entry per address: a fresh verdict replaces any earlier one.
             await state.set_setting(SETTINGS_PREFIX + email, json.dumps({
                 "verdict": result.verdict,
@@ -171,20 +199,24 @@ class PreclearedClient:
 
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT, transport=self._transport) as client:
-                resp = await client.post(API_URL, json=payload, headers=headers)
+                resp = await asyncio.wait_for(
+                    client.post(API_URL, json=payload, headers=headers), TOTAL_TIMEOUT)
         except httpx.HTTPError as e:
-            return Clearance(allowed=False, held=True,
+            return Clearance(allowed=False, held=True, pause_checks=True,
                              reason=self._redact(f"Precleared unreachable: {e}"))
+        except asyncio.TimeoutError:
+            return Clearance(allowed=False, held=True, pause_checks=True,
+                             reason="Precleared took too long to answer")
 
         if resp.status_code == 429:
             if self.api_key or _error_code(resp) == "rate_limited":
                 # A key that runs out of checks gets a 402, so a 429 on a key
                 # is Precleared's per-minute rate limit.
-                return Clearance(allowed=False, held=True,
-                                 reason="Precleared rate limit reached; trying again next cycle")
+                return Clearance(allowed=False, held=True, pause_checks=True,
+                                 reason="Precleared rate limit reached")
             # Keyless allowance used up: a free key gives this install its own.
             return Clearance(
-                allowed=False, held=True,
+                allowed=False, held=True, pause_checks=True,
                 reason="Precleared daily allowance used up; add PRECLEARED_API_KEY "
                        f"(free key: {GET_KEY_URL}) or wait until tomorrow",
             )
@@ -192,31 +224,35 @@ class PreclearedClient:
             # The key has no checks left today and no prepaid checks, so
             # another key won't help: buying more (or tomorrow) will.
             return Clearance(
-                allowed=False, held=True,
+                allowed=False, held=True, pause_checks=True,
                 reason="Precleared: your key has no checks left today; "
                        f"add more at {BUY_URL} or wait until tomorrow",
             )
         if resp.status_code == 401:
-            return Clearance(allowed=False, held=True,
+            return Clearance(allowed=False, held=True, pause_checks=True,
                              reason="PRECLEARED_API_KEY was rejected (wrong or revoked)")
         if resp.status_code != 200:
+            # Possibly about this address alone, so only its email waits.
             return Clearance(allowed=False, held=True,
-                             reason=self._redact(f"Precleared HTTP {resp.status_code}: {resp.text[:200]}"))
+                             reason=f"Precleared HTTP {resp.status_code}: {self._redact(resp.text)[:200]}")
 
         try:
             data = resp.json()
         except (ValueError, RecursionError):
-            return Clearance(allowed=False, held=True, reason="Precleared returned invalid JSON")
+            return Clearance(allowed=False, held=True, pause_checks=True,
+                             reason="Precleared returned invalid JSON")
 
         # Only a JSON object with a known verdict counts as an answer.
         # Anything else is treated like an unavailable check, so cold email
-        # is held, not failed, and the rest of the cycle carries on.
+        # is held, not failed. A 200 means the check was made (and counted),
+        # and an answer Franco can't read is about the API, not the address,
+        # so no more checks are spent on it this cycle.
         if not isinstance(data, dict):
-            return Clearance(allowed=False, held=True,
+            return Clearance(allowed=False, held=True, pause_checks=True,
                              reason="Precleared returned an unexpected response (not a JSON object)")
         verdict = data.get("verdict")
         if not isinstance(verdict, str) or verdict not in VERDICTS:
-            return Clearance(allowed=False, held=True,
+            return Clearance(allowed=False, held=True, pause_checks=True,
                              reason="Precleared returned a response without a known verdict")
 
         receipt = data.get("receipt")
@@ -231,7 +267,8 @@ class PreclearedClient:
         )
 
 
-def _address(to_email: str) -> str:
+def normalize_address(to_email: str) -> str:
+    """The form an address is checked and stored in."""
     return (to_email or "").strip().lower()
 
 
@@ -285,7 +322,7 @@ def _from_cache(raw: str, inputs: str) -> Clearance | None:
     if not isinstance(data, dict) or data.get("inputs") != inputs:
         return None
     verdict = data.get("verdict")
-    if not isinstance(verdict, str) or verdict not in DEFINITE_VERDICTS:
+    if not isinstance(verdict, str) or verdict not in VERDICTS:
         return None
     try:
         checked_at = datetime.fromisoformat(str(data["checked_at"]))
@@ -293,7 +330,8 @@ def _from_cache(raw: str, inputs: str) -> Clearance | None:
         return None
     if checked_at.tzinfo is None:
         checked_at = checked_at.replace(tzinfo=timezone.utc)
-    if _utcnow() - checked_at > timedelta(days=CACHE_DAYS):
+    days = UNKNOWN_CACHE_DAYS if verdict == "unknown" else CACHE_DAYS
+    if _utcnow() - checked_at > timedelta(days=days):
         return None
     return Clearance(
         allowed=verdict == "ok_to_email",
