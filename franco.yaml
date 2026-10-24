@@ -102,10 +102,12 @@ compliance:
   # Optional: before the first cold email to each address, ask Precleared
   # (precleared.dev) whether cold email to it is allowed under the rules of
   # the recipient's country (UK PECR, US CAN-SPAM, Canada's CASL and others).
-  # Any verdict but ok_to_email stops that email, with the rule and the next
-  # step in the Outbox. One check per address, cached for 30 days. Native
-  # providers (gmail, smtp) only. A free key (PRECLEARED_API_KEY in .env)
-  # raises the daily allowance. Precleared receives the address, the
+  # A new address is checked after a cycle's sending, and its email is
+  # decided on the next cycle. Any verdict but ok_to_email stops that email,
+  # with the rule and the next step in the Outbox. One check per address,
+  # reused by its follow-ups for 30 days. Needs require_footer: true.
+  # Native providers (gmail, smtp) only. A free key (PRECLEARED_API_KEY in
+  # .env) raises the daily allowance. Precleared receives the address, the
   # settings below and the first 200 characters of product.description.
   precleared:
     enabled: false
