@@ -426,11 +426,12 @@ def normalize_prospect_country(v) -> str:
 class PreclearedConfig(BaseModel):
     """Optional per-recipient cold-email check through Precleared.
 
-    Off by default. When on, each new recipient is checked once, before the
-    first cold email, against the cold-email rules of the recipient's
-    country (UK PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and others).
-    Any verdict other than ok_to_email stops that email, with the reason.
-    See franco/integrations/precleared.py.
+    Off by default. When on, each recipient is checked before their first
+    cold email against the cold-email rules of their country (UK PECR, US
+    CAN-SPAM, Canada's CASL, Germany's UWG and others), and later steps reuse
+    the verdict. Any verdict other than ok_to_email stops that email, with
+    the reason. Needs compliance.require_footer. See
+    franco/integrations/precleared.py.
     """
 
     enabled: bool = False
