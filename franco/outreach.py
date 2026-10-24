@@ -152,7 +152,15 @@ def strip_quoted(text: str, footer: str = "") -> str:
 
 def compliance_problem(compliance) -> str:
     """Why cold email can't go out at all right now, or "" if it can."""
-    if compliance is None or not getattr(compliance, "require_footer", False):
+    if compliance is None:
+        return ""
+    if not getattr(compliance, "require_footer", False):
+        # Precleared's ok_to_email assumes the email carries a compliant
+        # footer, and Franco's own footer is what provides it.
+        if getattr(getattr(compliance, "precleared", None), "enabled", False) is True:
+            return ("compliance.precleared is on but require_footer is off: "
+                    "Precleared's ok_to_email assumes each cold email carries "
+                    "your footer, so nothing will be sent")
         return ""
     if not (getattr(compliance, "postal_address", "") or "").strip():
         return ("compliance.postal_address is blank — every cold email must "
