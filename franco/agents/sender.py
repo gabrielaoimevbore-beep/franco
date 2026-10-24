@@ -14,6 +14,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 
 from franco.brain import Brain
@@ -21,7 +22,7 @@ from franco.config import FrancoConfig, EnvConfig
 from franco.gate import pre_send_check
 from franco.integrations.instantly import InstantlyClient
 from franco.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
-from franco.integrations.precleared import PreclearedClient
+from franco.integrations.precleared import PreclearedClient, normalize_address
 from franco.outreach import (
     add_business_days, build_footer, compliance_problem, local_date,
     send_at_utc, unsubscribe_headers, with_footer,
@@ -34,6 +35,9 @@ logger = logging.getLogger("franco.sender")
 # instead of bursting the daily cap in one minute.
 MAX_SENDS_PER_CYCLE = 8
 SEND_JITTER_SECONDS = (4, 15)
+# Optional compliance check: no new check starts after this many seconds of
+# checking in one cycle (each check is limited to 40 seconds on its own).
+CHECK_SECONDS_PER_CYCLE = 90
 
 # Prospect pipeline statuses that mean "stop emailing this person" — and,
 # because one reply speaks for the account, everyone else at their company.
@@ -84,6 +88,13 @@ class Sender:
             )
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
+        # Optional compliance check: when each address's last check got no
+        # verdict. Those are asked again only after addresses that haven't
+        # failed, so a few that always fail can't hold the others up.
+        self._check_failed_at: dict[str, float] = {}
+        # Of those, the ones whose failure was most likely Precleared's (no
+        # connection, allowance used up...) rather than the address's.
+        self._check_failed_on_service: set[str] = set()
 
     @property
     def is_native(self) -> bool:
@@ -556,15 +567,20 @@ class Sender:
         # One step per person per cycle: sending step 1 re-times step 2 to a
         # later business day, but step 2's stale row may still be in `due`.
         sent_sequences: set[tuple[str, str]] = set()
-        # Optional compliance check (compliance.precleared). Once Precleared
-        # can't be asked (allowance used up, network), cold email that needs
-        # a fresh check waits for a later cycle; replies still go out. Fresh
-        # checks are capped per cycle so slow answers can't stall the cycle.
-        compliance_paused = False
-        fresh_checks = 0
+        # Optional compliance check (compliance.precleared). Sending uses only
+        # verdicts already stored. Cold email to an address without one
+        # waits, and the address is checked after this cycle's sending, so no
+        # request to Precleared ever sits between reading an email and
+        # sending it. Once the budget is sent, the queue is walked on only to
+        # find addresses to check, at most one per email a cycle can send.
+        to_check: dict[str, dict] = {}
+        new_addresses = 0
         for item in due:
-            if sent >= budget:
+            collecting = sent >= budget
+            if collecting and (self.precleared is None or new_addresses >= budget):
                 break
+            if collecting and item["kind"] != "sequence":
+                continue
             if item["kind"] == "sequence" and \
                     (item.get("campaign_id"), item["prospect_id"]) in sent_sequences:
                 continue
@@ -610,37 +626,12 @@ class Sender:
             if self.precleared is not None and item["kind"] == "sequence":
                 clearance = await self.precleared.cached(item["to_email"], self.state)
                 if clearance is None:
-                    if compliance_paused or fresh_checks >= budget:
-                        continue  # asked on a later cycle
-                    fresh_checks += 1
-                    clearance = await self.precleared.check(item["to_email"], self.state)
-                    if clearance.held:
-                        compliance_paused = True
-                        logger.warning(
-                            "Sender: compliance check unavailable, holding cold "
-                            f"email until a later cycle: {clearance.reason}"
-                        )
-                        continue
-                    # A check can take seconds, and anything may change
-                    # meanwhile (a rejection, a suppression, a reply, the kill
-                    # switch), so Franco's own checks run again on fresh data.
-                    # If one now stops the email, the next cycle records why;
-                    # the verdict is kept, so that costs no second check.
-                    if await self.state.get_setting(KILL_SWITCH_KEY):
-                        logger.warning("Sender: sending was paused during the cycle; stopping.")
-                        break
-                    fresh = await self.state.get_outbox_item(item["id"])
-                    prospect = await self.state.get_prospect(item["prospect_id"])
-                    if (fresh is None or fresh["status"] != "approved" or prospect is None
-                            or await self._sequence_hold(fresh, prospect)
-                            or not pre_send_check(
-                                fresh["to_email"], fresh["subject"], fresh["body"],
-                                prospect=prospect, allow_risky=allow_risky,
-                                kind=fresh["kind"], required_footer=footer,
-                                blocked_phrases=blocked_claims,
-                            )):
-                        continue
-                    item = fresh
+                    key = normalize_address(item["to_email"])
+                    if key not in to_check:
+                        to_check[key] = {"to_email": item["to_email"], "ids": []}
+                        new_addresses += key not in self._check_failed_at
+                    to_check[key]["ids"].append(item["id"])
+                    continue  # decided on a later cycle, once checked
                 if not clearance.allowed:
                     await self.state.update_outbox_item(
                         item["id"], status="failed",
@@ -652,6 +643,8 @@ class Sender:
                     )
                     continue
                 receipt_id = clearance.receipt_id
+            if collecting:
+                continue
 
             send_kwargs = {
                 "thread_ref": item.get("thread_ref", ""),
@@ -720,3 +713,62 @@ class Sender:
         if sent:
             logger.info(f"Sender: {sent} email(s) sent this cycle "
                         f"({sent_today + sent}/{max_daily} today).")
+        if to_check:
+            # Addresses that haven't failed first, in queue order, then those
+            # whose last check failed, longest-waiting first.
+            order = sorted(to_check, key=lambda key: (
+                key in self._check_failed_at, self._check_failed_at.get(key, 0.0)))
+            await self._check_new_recipients([to_check[key] for key in order[:budget]])
+
+    async def _check_new_recipients(self, addresses: list[dict]):
+        """Ask Precleared about addresses with no current verdict.
+
+        Runs after the cycle's sending, so no email waits on an answer. Each
+        verdict is stored, and the emails waiting on it are decided on the
+        next cycle, after every other pre-send check has run again on fresh
+        data. An address that can't be checked now is asked about again then.
+        """
+        started = time.monotonic()
+        checked = 0
+        for entry in addresses:
+            if time.monotonic() - started > CHECK_SECONDS_PER_CYCLE:
+                break
+            if await self.state.get_setting(KILL_SWITCH_KEY):
+                break  # sending was paused: nothing more goes out
+            if not await self._still_waiting(entry):
+                continue  # rejected or suppressed since the queue was read
+            key = normalize_address(entry["to_email"])
+            clearance = await self.precleared.check(entry["to_email"], self.state)
+            if not clearance.held:
+                # Precleared is answering again, so addresses that only met
+                # its failures get their place in the queue back.
+                for done in self._check_failed_on_service | {key}:
+                    self._check_failed_at.pop(done, None)
+                self._check_failed_on_service.clear()
+                checked += 1
+                continue
+            self._check_failed_at[key] = time.monotonic()
+            if clearance.pause_checks:
+                self._check_failed_on_service.add(key)
+            else:
+                self._check_failed_on_service.discard(key)
+            logger.warning(
+                f"Sender: compliance check unavailable for {entry['to_email']}, "
+                f"holding its cold email until a later cycle: {clearance.reason}"
+            )
+            if clearance.pause_checks:
+                break  # most likely not about this address
+        if checked:
+            logger.info(f"Sender: checked {checked} new recipient(s) with Precleared; "
+                        "their emails are decided next cycle.")
+
+    async def _still_waiting(self, entry: dict) -> bool:
+        """Whether an address collected for a check still has an approved
+        email waiting and isn't suppressed (the queue may be minutes old)."""
+        if await self.state.suppression_for(entry["to_email"]):
+            return False
+        for item_id in entry["ids"]:
+            item = await self.state.get_outbox_item(item_id)
+            if item is not None and item["status"] == "approved":
+                return True
+        return False
