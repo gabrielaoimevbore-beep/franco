@@ -306,6 +306,26 @@ async def test_cold_mail_held_not_failed_without_postal_address(state):
 
 
 @pytest.mark.asyncio
+async def test_held_cold_backlog_never_delays_a_due_reply(state):
+    # More held cold email than one page of the outbox drain: the reply,
+    # due later than all of it, still goes out this cycle.
+    config = make_config(compliance={"postal_address": ""})
+    pid = await person(state, email="jane@example.com")
+    for step in range(1, 31):
+        await state.add_outbox_item(prospect_id=pid, to_email="jane@example.com",
+                                    subject=f"step {step}", body="Note.", send_at=PAST,
+                                    status="approved", campaign_id="c1", step=step)
+    await state.add_outbox_item(prospect_id=pid, to_email="jane@example.com", kind="reply",
+                                subject="Re: hi", body="Thanks!",
+                                send_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                                status="approved", conversation_id="c1")
+    provider = RecordingProvider()
+    await make_sender(state, config, provider)._drain_due()
+    assert [s["subject"] for s in provider.sent] == ["Re: hi"]
+    assert len(await outbox(state, "approved")) == 30
+
+
+@pytest.mark.asyncio
 async def test_unsubscribe_headers_only_on_sequence_mail(state):
     config = make_config(outreach={"campaigns": {}})
     footer = build_footer(config.compliance, config.persona)
