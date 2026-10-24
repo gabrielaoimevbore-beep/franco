@@ -396,6 +396,89 @@ class OutreachConfig(BaseModel):
         return v
 
 
+# Precleared's terms for where a prospect's address came from.
+PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
+# Where the sending business may be based, in Precleared's terms.
+PRECLEARED_SENDER_COUNTRIES = ("GB", "US", "AE")
+
+
+def normalize_prospect_country(v) -> str:
+    """A two-letter country code ("us" -> "US", "UK" -> "GB"), or "" for none.
+
+    Raises ValueError on anything else, including the booleans YAML makes of
+    an unquoted NO (Norway) or ON, so a typo is never silently ignored.
+    """
+    if isinstance(v, bool):
+        raise ValueError(
+            f"prospect_country was read as {v}. YAML turns an unquoted NO or "
+            'ON into true/false, so quote the code, e.g. prospect_country: "NO".'
+        )
+    v = str(v or "").strip().upper()
+    v = {"UK": "GB", "USA": "US"}.get(v, v)
+    if v and not (len(v) == 2 and v.isascii() and v.isalpha()):
+        raise ValueError(
+            f"'{v}' is not a valid prospect_country. Use a two-letter "
+            "country code such as US or GB, or leave it empty."
+        )
+    return v
+
+
+class PreclearedConfig(BaseModel):
+    """Optional per-recipient cold-email check through Precleared.
+
+    Off by default. When on, each new recipient is checked once, before the
+    first cold email, against the cold-email rules of the recipient's
+    country (UK PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and others).
+    Any verdict other than ok_to_email stops that email, with the reason.
+    See franco/integrations/precleared.py.
+    """
+
+    enabled: bool = False
+    # Where your business is based: GB, US or AE. Required when enabled.
+    sender_country: str = ""
+    # Where prospect addresses come from, in Precleared's terms. Franco
+    # builds most addresses from a learned pattern, so the honest default is
+    # "unknown"; use "published" only if yours are copied from the
+    # businesses' own websites.
+    address_source: str = "unknown"
+    # Optional: the country your prospects are in (two letters, e.g. "US"),
+    # if they are all in one. Precleared uses it only when it can't work out
+    # the recipient's country from the address, company records or the
+    # company's website. Leave empty if your prospects are spread out.
+    prospect_country: str = ""
+
+    @field_validator("sender_country", mode="before")
+    @classmethod
+    def _upper_country(cls, v) -> str:
+        v = str(v or "").strip().upper()
+        return "GB" if v == "UK" else v
+
+    @field_validator("address_source", mode="before")
+    @classmethod
+    def _valid_source(cls, v) -> str:
+        v = str(v or "unknown").strip().lower()
+        if v not in PRECLEARED_ADDRESS_SOURCES:
+            raise ValueError(
+                f"'{v}' is not a valid address_source. "
+                f"Use one of: {', '.join(PRECLEARED_ADDRESS_SOURCES)}."
+            )
+        return v
+
+    @field_validator("prospect_country", mode="before")
+    @classmethod
+    def _valid_prospect_country(cls, v) -> str:
+        return normalize_prospect_country(v)
+
+    @model_validator(mode="after")
+    def _country_when_enabled(self):
+        if self.enabled and self.sender_country not in PRECLEARED_SENDER_COUNTRIES:
+            raise ValueError(
+                "compliance.precleared.sender_country must be GB, US or AE "
+                "when the check is enabled."
+            )
+        return self
+
+
 class ComplianceConfig(BaseModel):
     """Commercial-email obligations, enforced at send time by the gate."""
 
@@ -415,6 +498,8 @@ class ComplianceConfig(BaseModel):
     # Acknowledge an opt-out — only after the suppression is recorded.
     send_opt_out_ack: bool = False
     opt_out_ack: str = "Understood. I have recorded the request to stop."
+    # Optional per-recipient check before the first cold email. Off by default.
+    precleared: PreclearedConfig = PreclearedConfig()
 
 
 class FrancoConfig(BaseModel):
@@ -451,6 +536,8 @@ class EnvConfig(BaseModel):
     imap_port: int = 993
     imap_username: str = ""
     imap_password: str = ""
+    # Optional: only used when compliance.precleared.enabled is true.
+    precleared_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -561,6 +648,7 @@ def load_env() -> EnvConfig:
         imap_port=int(os.getenv("IMAP_PORT", "993").strip() or 993),
         imap_username=os.getenv("IMAP_USERNAME", "").strip(),
         imap_password=os.getenv("IMAP_PASSWORD", "").strip(),
+        precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
     )
     return env
 
