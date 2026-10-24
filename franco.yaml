@@ -99,3 +99,16 @@ compliance:
   blocked_claims: []             # phrases no outgoing email may contain
   send_opt_out_ack: false        # reply once after recording an opt-out
   opt_out_ack: "Understood. I have recorded the request to stop."
+  # Optional: before the first cold email to each address, ask Precleared
+  # (precleared.dev) whether cold email to it is allowed under the rules of
+  # the recipient's country (UK PECR, US CAN-SPAM, Canada's CASL and others).
+  # Any verdict but ok_to_email stops that email, with the rule and the next
+  # step in the Outbox. One check per address, cached for 30 days. Native
+  # providers (gmail, smtp) only. A free key (PRECLEARED_API_KEY in .env)
+  # raises the daily allowance. Precleared receives the address, the
+  # settings below and the first 200 characters of product.description.
+  precleared:
+    enabled: false
+    sender_country: ""           # GB, US or AE: where your business is based
+    address_source: "unknown"    # published | bought | scraped | given | unknown
+    prospect_country: ""         # optional, e.g. "US" if all your prospects are in one country
