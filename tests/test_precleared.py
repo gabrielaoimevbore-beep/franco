@@ -1,8 +1,11 @@
-"""The optional Precleared check in the native send path: off by default, one
-check per address, a stopping verdict fails the outbox item with the reason,
-an unavailable check holds cold email without failing it, replies are never
-checked. No network: every Precleared call goes to an httpx.MockTransport."""
+"""The optional Precleared check in the native send path: off by default;
+sending uses only stored verdicts, and a new address is checked after the
+cycle's sending and decided on the next cycle; one check per address; a
+stopping verdict fails the outbox item with the reason; an unavailable check
+holds cold email without failing it; replies are never checked. No network:
+every Precleared call goes to an httpx.MockTransport."""
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -17,7 +20,10 @@ from pydantic import ValidationError
 
 from franco.config import EnvConfig, PreclearedConfig, load_config, load_env
 from franco.integrations.precleared import BUY_URL, SETTINGS_PREFIX, PreclearedClient
-from tests.phase1_helpers import make_config
+from tests.phase1_helpers import (
+    RecordingProvider, account_row, import_accounts, make_config, make_writer,
+)
+from tests.phase1_helpers import make_sender as make_config_sender
 from tests.test_outbox_native import (  # noqa: F401  (state is a fixture)
     Cfg,
     Env,
@@ -57,6 +63,18 @@ CONSENT_BODY = {
     "receipt": {"id": "cc_rcpt_NO0000000001"},
 }
 
+BLOCKED_BODY = {
+    "verdict": "blocked",
+    "confidence": "high",
+    "reasons": [{
+        "rule_key": "recipient_opted_out",
+        "text": "The recipient has opted out of marketing email.",
+        "source_title": "PECR reg. 22(3)",
+    }],
+    "next_step": "Do not send. Keep the address on your suppression list.",
+    "receipt": {"id": "cc_rcpt_BL0000000001"},
+}
+
 UNKNOWN_BODY = {
     "verdict": "unknown",
     "reasons": [{"note": "The company register could not be reached."}],
@@ -85,6 +103,12 @@ def mock_raw(status, content):
     return httpx.MockTransport(lambda request: httpx.Response(
         status, content=content, headers={"Content-Type": "application/json"},
     ))
+
+
+async def cycles(sender, n=2):
+    """Run n send cycles: a new address is checked in one, decided in the next."""
+    for _ in range(n):
+        await sender._drain_due()
 
 
 def with_check(sender, transport, api_key=""):
@@ -257,6 +281,21 @@ async def test_pitch_and_prospect_country_are_sent_only_when_set(state):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("body", [OK_BODY, CONSENT_BODY, BLOCKED_BODY, UNKNOWN_BODY],
+                         ids=["ok_to_email", "consent_needed", "blocked", "unknown"])
+async def test_only_ok_to_email_allows_sending_fresh_or_stored(state, body):
+    client = PreclearedClient("GB", transport=mock_precleared([], body))
+
+    fresh = await client.clear(JANE, state)
+    stored = await client.clear(JANE, state)
+
+    allowed = body["verdict"] == "ok_to_email"
+    assert (fresh.allowed, stored.allowed) == (allowed, allowed)
+    assert fresh.verdict == stored.verdict == body["verdict"]
+    assert not fresh.held and not stored.held
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("changed", [
     {"sender_country": "US"},
     {"address_source": "published"},
@@ -293,21 +332,29 @@ async def test_cache_entry_without_the_same_facts_is_not_reused(state):
     assert len(calls) == 1
 
 
+async def age_entry(state, email, days):
+    entry = json.loads(await state.get_setting(SETTINGS_PREFIX + email))
+    entry["checked_at"] = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    await state.set_setting(SETTINGS_PREFIX + email, json.dumps(entry))
+
+
 @pytest.mark.asyncio
-async def test_expired_verdict_is_checked_again(state):
+async def test_verdict_is_reused_for_30_days_then_checked_again(state):
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
     await client.clear(JANE, state)
-    entry = json.loads(await state.get_setting(SETTINGS_PREFIX + JANE))
-    entry["checked_at"] = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
-    await state.set_setting(SETTINGS_PREFIX + JANE, json.dumps(entry))
 
+    await age_entry(state, JANE, 29)
+    assert (await client.clear(JANE, state)).allowed
+    assert len(calls) == 1
+
+    await age_entry(state, JANE, 31)
     assert (await client.clear(JANE, state)).allowed
     assert len(calls) == 2
 
 
 @pytest.mark.asyncio
-async def test_unknown_verdict_stops_the_email_but_is_not_cached(state):
+async def test_unknown_verdict_stops_the_email_and_is_kept_for_a_day(state):
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, UNKNOWN_BODY))
 
@@ -316,7 +363,10 @@ async def test_unknown_verdict_stops_the_email_but_is_not_cached(state):
     assert not result.allowed and not result.held
     assert result.verdict == "unknown"
     assert "could not be reached" in result.reason
-    assert await state.get_setting(SETTINGS_PREFIX + JANE) == ""
+    assert (await client.clear(JANE, state)).verdict == "unknown"
+    assert len(calls) == 1
+    # It can be temporary, so after a day another email asks again.
+    await age_entry(state, JANE, 2)
     await client.clear(JANE, state)
     assert len(calls) == 2
 
@@ -325,7 +375,7 @@ async def test_unknown_verdict_stops_the_email_but_is_not_cached(state):
 
 
 @pytest.mark.asyncio
-async def test_ok_verdict_sends_and_logs_the_receipt(state):
+async def test_new_address_is_checked_after_sending_and_sent_next_cycle(state):
     pid = await jane(state)
     await queue(state, pid)
     calls = []
@@ -333,8 +383,12 @@ async def test_ok_verdict_sends_and_logs_the_receipt(state):
     sender = with_check(make_sender(state, provider), mock_precleared(calls, OK_BODY))
 
     await sender._drain_due()
+    assert provider.sent == []
+    assert len(calls) == 1
 
+    await sender._drain_due()
     assert len(provider.sent) == 1
+    assert len(calls) == 1
     assert calls[0]["json"] == {
         "recipient_email": JANE,
         "sender_country": "GB",
@@ -344,6 +398,33 @@ async def test_ok_verdict_sends_and_logs_the_receipt(state):
     assert "authorization" not in calls[0]["headers"]
     assert calls[0]["headers"]["user-agent"].startswith("franco")
     assert await logged_receipts(state) == ["cc_rcpt_OK0000000001"]
+
+
+@pytest.mark.asyncio
+async def test_no_email_is_sent_after_a_check_in_the_same_cycle(state):
+    # A new address first in the queue, then cold email with a stored
+    # verdict and a reply: both go out before Precleared is asked anything.
+    pid = await jane(state)
+    other = await seed_prospect(state, email=SAM)
+    await queue(state, pid)
+    await queue(state, other, to=SAM)
+    await queue_reply(state)
+    await PreclearedClient("GB", transport=mock_precleared([], OK_BODY)).clear(SAM, state)
+    events = []
+
+    def handler(request):
+        events.append(("check", json.loads(request.content)["recipient_email"]))
+        return httpx.Response(200, json=OK_BODY)
+
+    class Recording(FakeProvider):
+        async def send_email(self, to_email, *args, **kwargs):
+            events.append(("send", to_email))
+            return await super().send_email(to_email, *args, **kwargs)
+
+    sender = with_check(make_sender(state, Recording()), httpx.MockTransport(handler))
+    await sender._drain_due()
+
+    assert events == [("send", SAM), ("send", REPLY), ("check", JANE)]
 
 
 @pytest.mark.asyncio
@@ -358,20 +439,49 @@ async def test_api_key_is_sent_as_bearer(state):
 
 
 @pytest.mark.asyncio
-async def test_consent_needed_fails_the_item_with_the_reason(state):
+@pytest.mark.parametrize("body", [CONSENT_BODY, BLOCKED_BODY, UNKNOWN_BODY],
+                         ids=["consent_needed", "blocked", "unknown"])
+async def test_stopping_verdict_fails_the_item_with_the_reason(state, body):
     pid = await jane(state)
     await queue(state, pid)
     provider = FakeProvider()
-    sender = with_check(make_sender(state, provider), mock_precleared([], CONSENT_BODY))
+    sender = with_check(make_sender(state, provider), mock_precleared([], body))
 
-    await sender._drain_due()
+    await cycles(sender)
 
     assert provider.sent == []
     failed = await state.get_outbox(status="failed")
     assert len(failed) == 1
-    assert failed[0]["error"].startswith("precleared: consent_needed")
-    assert "PECR reg. 22(2)" in failed[0]["error"]
-    assert "Get consent first" in failed[0]["error"]
+    assert failed[0]["error"].startswith(f"precleared: {body['verdict']}: ")
+    assert body["next_step"] in failed[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_consent_reason_names_the_rule_and_its_source(state):
+    pid = await jane(state)
+    await queue(state, pid)
+    sender = with_check(make_sender(state, FakeProvider()), mock_precleared([], CONSENT_BODY))
+
+    await cycles(sender)
+
+    error = (await state.get_outbox(status="failed"))[0]["error"]
+    assert "Sole traders count as individuals" in error
+    assert "PECR reg. 22(2)" in error
+
+
+@pytest.mark.asyncio
+async def test_stored_blocked_verdict_stops_the_email_without_a_check(state):
+    pid = await jane(state)
+    await queue(state, pid)
+    await PreclearedClient("GB", transport=mock_precleared([], BLOCKED_BODY)).clear(JANE, state)
+    calls = []
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), mock_precleared(calls, OK_BODY))
+
+    await sender._drain_due()
+
+    assert calls == [] and provider.sent == []
+    assert (await state.get_outbox(status="failed"))[0]["error"].startswith("precleared: blocked")
 
 
 @pytest.mark.asyncio
@@ -383,12 +493,34 @@ async def test_follow_up_is_cancelled_when_the_first_email_was_stopped(state):
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), mock_precleared(calls, CONSENT_BODY))
 
-    await sender._drain_due()
-    await sender._drain_due()
+    await cycles(sender)
 
     assert provider.sent == []
     statuses = {i["step"]: i["status"] for i in await state.get_outbox()}
     assert statuses == {1: "failed", 2: "cancelled"}
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_follow_up_is_checked_when_there_is_no_current_verdict(state):
+    # Step 1 went out before the check was switched on; step 2 is checked,
+    # and a stopping verdict ends the sequence.
+    pid = await jane(state)
+    provider = FakeProvider()
+    sender = make_sender(state, provider)
+    await queue(state, pid, step=1)
+    await sender._drain_due()
+    assert len(provider.sent) == 1
+
+    calls = []
+    with_check(sender, mock_precleared(calls, CONSENT_BODY))
+    await queue(state, pid, step=2)
+    await queue(state, pid, step=3)
+    await cycles(sender)
+
+    assert len(provider.sent) == 1
+    assert {i["step"]: i["status"] for i in await state.get_outbox()} == {
+        1: "sent", 2: "failed", 3: "cancelled"}
     assert len(calls) == 1
 
 
@@ -400,7 +532,7 @@ async def test_one_check_per_address(state):
     sender = with_check(make_sender(state, provider), mock_precleared(calls, OK_BODY))
 
     await queue(state, pid, step=1)
-    await sender._drain_due()
+    await cycles(sender)
     await queue(state, pid, step=2)
     await sender._drain_due()
 
@@ -411,6 +543,20 @@ async def test_one_check_per_address(state):
 
 
 @pytest.mark.asyncio
+async def test_two_emails_to_one_new_address_share_one_check(state):
+    pid = await jane(state)
+    await queue(state, pid, step=1)
+    await queue(state, pid, step=1, campaign="c2")
+    calls = []
+    sender = with_check(make_sender(state, FakeProvider()), mock_precleared(calls, CONSENT_BODY))
+
+    await cycles(sender)
+
+    assert len(calls) == 1
+    assert len(await state.get_outbox(status="failed")) == 2
+
+
+@pytest.mark.asyncio
 async def test_stopping_verdict_is_remembered_for_other_campaigns(state):
     pid = await jane(state)
     calls = []
@@ -418,7 +564,7 @@ async def test_stopping_verdict_is_remembered_for_other_campaigns(state):
     sender = with_check(make_sender(state, provider), mock_precleared(calls, CONSENT_BODY))
 
     await queue(state, pid, step=1)
-    await sender._drain_due()
+    await cycles(sender)
     # Another campaign's first email to the same address: no second check.
     await queue(state, pid, step=1, campaign="c2")
     await sender._drain_due()
@@ -438,7 +584,7 @@ async def test_email_the_gate_blocks_spends_no_check(state):
     calls = []
     sender = with_check(make_sender(state, FakeProvider()), mock_precleared(calls, OK_BODY))
 
-    await sender._drain_due()
+    await cycles(sender)
 
     assert calls == []
     assert "gate" in (await state.get_outbox(status="failed"))[0]["error"]
@@ -459,7 +605,7 @@ async def test_replies_are_never_checked(state):
 
 
 @pytest.mark.asyncio
-async def test_fresh_checks_are_capped_per_cycle(state):
+async def test_new_checks_are_capped_per_cycle(state):
     for n in range(10):
         pid = await seed_prospect(state, email=f"person{n}@example.com")
         await queue(state, pid, to=f"person{n}@example.com")
@@ -467,18 +613,260 @@ async def test_fresh_checks_are_capped_per_cycle(state):
     sender = with_check(make_sender(state, FakeProvider()), mock_precleared(calls, CONSENT_BODY))
 
     await sender._drain_due()
-
-    # The cycle's send budget (8) bounds its fresh checks; the rest wait.
+    # At most one check per email the cycle could send (8); the rest wait.
     assert len(calls) == 8
+    assert len(await state.get_outbox(status="approved")) == 10
+
+    await sender._drain_due()
     assert len(await state.get_outbox(status="failed")) == 8
-    assert len(await state.get_outbox(status="approved")) == 2
-
-
-# ── whatever changes while a check runs wins ──
+    assert len(calls) == 10
 
 
 @pytest.mark.asyncio
-async def test_email_rejected_during_the_check_is_not_sent(state):
+async def test_checks_stop_once_the_cycles_checking_time_is_used(state, monkeypatch):
+    import franco.agents.sender as sender_module
+
+    monkeypatch.setattr(sender_module, "CHECK_SECONDS_PER_CYCLE", 0.05)
+    for n in range(3):
+        pid = await seed_prospect(state, email=f"person{n}@example.com")
+        await queue(state, pid, to=f"person{n}@example.com")
+    calls = []
+
+    async def slow(request):
+        calls.append(1)
+        await asyncio.sleep(0.1)
+        return httpx.Response(200, json=OK_BODY)
+
+    sender = with_check(make_sender(state, FakeProvider()), httpx.MockTransport(slow))
+    await sender._drain_due()
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_new_addresses_are_checked_even_when_the_cycle_sends_its_full_budget(state):
+    for n in range(9):
+        pid = await seed_prospect(state, email=f"cleared{n}@example.com")
+        await queue(state, pid, to=f"cleared{n}@example.com")
+        await PreclearedClient("GB", transport=mock_precleared([], OK_BODY)).clear(
+            f"cleared{n}@example.com", state)
+    for n in range(3):
+        pid = await seed_prospect(state, email=f"new{n}@example.com")
+        await queue(state, pid, to=f"new{n}@example.com")
+    calls = []
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), mock_precleared(calls, OK_BODY))
+
+    await sender._drain_due()
+    assert len(provider.sent) == 8  # the budget, even with a ninth cleared email
+    assert len(calls) == 3
+
+    await sender._drain_due()
+    assert len(provider.sent) == 12
+
+
+async def queue_people(state, emails):
+    for email in emails:
+        pid = await seed_prospect(state, email=email)
+        await queue(state, pid, to=email)
+
+
+@pytest.mark.asyncio
+async def test_addresses_that_keep_failing_do_not_hold_up_new_ones(state):
+    refused = [f"refused{n}@example.com" for n in range(8)]
+    await queue_people(state, refused + [SAM])
+    calls = []
+
+    def handler(request):
+        email = json.loads(request.content)["recipient_email"]
+        calls.append(email)
+        if email in refused:
+            return httpx.Response(500, text="server error")
+        return httpx.Response(200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(handler))
+    await cycles(sender, 3)
+
+    assert [m["to"] for m in provider.sent] == [SAM]
+    assert calls[8] == SAM  # first in the second cycle, ahead of the failures
+    assert len(await state.get_outbox(status="approved")) == 8
+
+
+@pytest.mark.asyncio
+async def test_failed_addresses_do_not_use_up_the_search_after_the_budget_is_sent(state):
+    refused = [f"refused{n}@example.com" for n in range(8)]
+    await queue_people(state, refused)
+    calls = []
+
+    def handler(request):
+        email = json.loads(request.content)["recipient_email"]
+        calls.append(email)
+        return httpx.Response(500 if email in refused else 200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(handler))
+    await sender._drain_due()  # all eight fail
+    for n in range(8):
+        await queue_people(state, [f"cleared{n}@example.com"])
+        await PreclearedClient("GB", transport=mock_precleared([], OK_BODY)).clear(
+            f"cleared{n}@example.com", state)
+    await queue_people(state, [SAM])
+    calls.clear()
+
+    await sender._drain_due()
+
+    assert len(provider.sent) == 8
+    assert calls[0] == SAM
+
+
+@pytest.mark.asyncio
+async def test_an_outage_does_not_push_early_prospects_behind_new_ones(state):
+    early = [f"early{n}@example.com" for n in range(4)]
+    await queue_people(state, early)
+    outage = {"on": True}
+
+    def handler(request):
+        if outage["on"]:
+            return httpx.Response(429, json={"error": "daily_limit"})
+        return httpx.Response(200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(handler))
+    await cycles(sender, 4)  # each cycle, one early address meets the used-up allowance
+
+    outage["on"] = False
+    for batch in range(3):
+        await queue_people(state, [f"later{batch}_{n}@example.com" for n in range(8)])
+        await sender._drain_due()
+
+    sent = [m["to"] for m in provider.sent]
+    assert all(e in sent for e in early)
+
+
+@pytest.mark.asyncio
+async def test_a_success_does_not_forgive_addresses_that_failed_on_their_own(state):
+    refused = [f"refused{n}@example.com" for n in range(8)]
+    await queue_people(state, refused)
+    calls = []
+
+    def handler(request):
+        email = json.loads(request.content)["recipient_email"]
+        calls.append(email)
+        return httpx.Response(500 if email in refused else 200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(handler))
+    await sender._drain_due()  # the refused addresses all fail
+    await queue_people(state, [f"fresh{n}@example.com" for n in range(8)])
+    await sender._drain_due()  # the fresh ones are cleared; the refused aren't reached
+    await queue_people(state, [SAM])
+    calls.clear()
+
+    await sender._drain_due()
+
+    assert len(provider.sent) == 8
+    assert calls[0] == SAM
+
+
+@pytest.mark.asyncio
+async def test_without_the_check_a_cycle_still_stops_at_its_budget(state):
+    for n in range(10):
+        await queue_people(state, [f"person{n}@example.com"])
+    provider = FakeProvider()
+    sender = make_sender(state, provider)
+
+    await sender._drain_due()
+
+    assert len(provider.sent) == 8
+
+
+@pytest.mark.asyncio
+async def test_an_address_that_always_times_out_does_not_stop_the_others(state, monkeypatch):
+    import franco.integrations.precleared as precleared
+
+    monkeypatch.setattr(precleared, "TOTAL_TIMEOUT", 0.05)
+    await queue_people(state, ["slow@example.com", SAM])
+    calls = []
+
+    async def handler(request):
+        email = json.loads(request.content)["recipient_email"]
+        calls.append(email)
+        if email == "slow@example.com":
+            await asyncio.sleep(1)
+        return httpx.Response(200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(handler))
+    await cycles(sender, 3)
+
+    assert [m["to"] for m in provider.sent] == [SAM]
+    assert calls[:3] == ["slow@example.com", SAM, "slow@example.com"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [
+    b"not json", json.dumps([]).encode(), json.dumps({"verdict": "ok_with_conditions"}).encode(),
+], ids=["not-json", "not-an-object", "unknown-verdict"])
+async def test_unreadable_answer_stops_checks_for_the_cycle(state, content):
+    await queue_people(state, [JANE, SAM])
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, content=content)
+
+    sender = with_check(make_sender(state, FakeProvider()), httpx.MockTransport(handler))
+    await sender._drain_due()
+
+    assert len(calls) == 1
+    assert len(await state.get_outbox(status="approved")) == 2
+
+
+@pytest.mark.asyncio
+async def test_pausing_sending_stops_checks_already_under_way(state):
+    await queue_people(state, [JANE, SAM, "third@example.com"])
+    calls = []
+
+    async def pause_meanwhile(request):
+        calls.append(1)
+        await state.set_setting("sending_paused", "paused from dashboard")
+        return httpx.Response(200, json=OK_BODY)
+
+    sender = with_check(make_sender(state, FakeProvider()), httpx.MockTransport(pause_meanwhile))
+    await sender._drain_due()
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["rejected", "suppressed"])
+async def test_address_whose_email_was_stopped_after_the_queue_was_read_is_not_checked(
+        state, change):
+    pid = await jane(state)
+    item_id = await queue(state, pid)
+    await queue_reply(state)
+    calls = []
+
+    class ChangedMidCycle(FakeProvider):
+        async def send_email(self, *args, **kwargs):
+            if change == "rejected":
+                await state.update_outbox_item(item_id, status="rejected")
+            else:
+                await state.add_suppression(JANE, reason="asked by phone")
+            return await super().send_email(*args, **kwargs)
+
+    sender = with_check(make_sender(state, ChangedMidCycle()), mock_precleared(calls, OK_BODY))
+    await sender._drain_due()
+
+    assert calls == []
+
+
+# ── the email is decided on fresh data the cycle after its check ──
+
+
+@pytest.mark.asyncio
+async def test_email_rejected_during_its_check_is_not_sent(state):
     pid = await jane(state)
     item_id = await queue(state, pid)
 
@@ -488,7 +876,7 @@ async def test_email_rejected_during_the_check_is_not_sent(state):
 
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), httpx.MockTransport(reject_meanwhile))
-    await sender._drain_due()
+    await cycles(sender)
 
     assert provider.sent == []
     assert (await state.get_outbox_item(item_id))["status"] == "rejected"
@@ -504,7 +892,7 @@ async def test_rejection_during_a_stopping_check_is_kept(state):
         return httpx.Response(200, json=CONSENT_BODY)
 
     sender = with_check(make_sender(state, FakeProvider()), httpx.MockTransport(reject_meanwhile))
-    await sender._drain_due()
+    await cycles(sender)
 
     assert (await state.get_outbox_item(item_id))["status"] == "rejected"
 
@@ -513,28 +901,83 @@ async def test_rejection_during_a_stopping_check_is_kept(state):
 async def test_suppression_added_during_the_check_wins(state):
     pid = await jane(state)
     item_id = await queue(state, pid)
+    calls = []
 
     async def suppress_meanwhile(request):
+        calls.append(1)
         await state.add_suppression(JANE, reason="asked by phone")
         return httpx.Response(200, json=OK_BODY)
 
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), httpx.MockTransport(suppress_meanwhile))
-    await sender._drain_due()
-    assert provider.sent == []
+    await cycles(sender)
 
-    # The next cycle records why, from the cached verdict: no second check.
-    await sender._drain_due()
     item = await state.get_outbox_item(item_id)
     assert item["status"] == "cancelled" and "suppressed" in item["error"]
+    assert provider.sent == []
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reply_during_the_check_stops_the_email(state):
+    pid = await jane(state)
+    item_id = await queue(state, pid)
+
+    async def reply_meanwhile(request):
+        await state.update_prospect_status(pid, "replied")
+        return httpx.Response(200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(reply_meanwhile))
+    await cycles(sender)
+
+    assert provider.sent == []
+    assert "replied" in (await state.get_outbox_item(item_id))["error"]
+
+
+@pytest.mark.asyncio
+async def test_address_found_invalid_during_the_check_is_not_sent(state):
+    pid = await jane(state)
+    item_id = await queue(state, pid)
+
+    async def invalid_meanwhile(request):
+        await state.update_prospect_email(pid, JANE, "invalid")
+        return httpx.Response(200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(invalid_meanwhile))
+    await cycles(sender)
+
+    assert provider.sent == []
+    assert "gate" in (await state.get_outbox_item(item_id))["error"]
+
+
+@pytest.mark.asyncio
+async def test_signoff_withdrawn_during_the_check_wins(state):
+    config = make_config()
+    await import_accounts(state, [account_row(1)])
+    await make_writer(state, config).run()
+    await state.approve_outbox()
+    for item in await state.get_outbox(limit=500):
+        await state.update_outbox_item(item["id"], send_at="2000-01-01T00:00:00")
+    await state.set_signoff("M1", "Hemin")
+
+    async def withdraw_meanwhile(request):
+        await state.clear_signoff("M1")
+        return httpx.Response(200, json=OK_BODY)
+
+    provider = RecordingProvider()
+    sender = with_check(make_config_sender(state, config, provider),
+                        httpx.MockTransport(withdraw_meanwhile))
+    await cycles(sender)
+
     assert provider.sent == []
 
 
 @pytest.mark.asyncio
-async def test_kill_switch_during_the_check_stops_the_cycle(state):
+async def test_kill_switch_set_during_a_check_holds_the_next_cycle(state):
     pid = await jane(state)
     await queue(state, pid)
-    await queue_reply(state)
 
     async def pause_meanwhile(request):
         await state.set_setting("sending_paused", "paused from dashboard")
@@ -542,10 +985,62 @@ async def test_kill_switch_during_the_check_stops_the_cycle(state):
 
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), httpx.MockTransport(pause_meanwhile))
-    await sender._drain_due()
+    await sender._run_native()
+    await sender._run_native()
 
     assert provider.sent == []
-    assert len(await state.get_outbox(status="approved")) == 2
+    assert len(await state.get_outbox(status="approved")) == 1
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_checked_once_sending_is_paused(state):
+    pid = await jane(state)
+    await queue(state, pid)
+    await queue_reply(state)
+    calls = []
+
+    class PausedMidCycle(FakeProvider):
+        async def send_email(self, *args, **kwargs):
+            await state.set_setting("sending_paused", "paused from dashboard")
+            return await super().send_email(*args, **kwargs)
+
+    sender = with_check(make_sender(state, PausedMidCycle()), mock_precleared(calls, OK_BODY))
+    await sender._drain_due()
+
+    assert calls == []
+
+
+# ── the footer the verdict assumes ──
+
+
+def test_check_with_the_footer_off_is_a_compliance_problem():
+    from franco.outreach import compliance_problem
+
+    on = {"enabled": True, "sender_country": "GB"}
+    problem = compliance_problem(
+        make_config(compliance={"require_footer": False, "precleared": on}).compliance)
+    assert "require_footer" in problem
+    assert compliance_problem(make_config(compliance={"require_footer": False}).compliance) == ""
+    assert compliance_problem(make_config(compliance={"precleared": on}).compliance) == ""
+
+
+@pytest.mark.asyncio
+async def test_cold_email_is_held_while_the_check_is_on_and_the_footer_off(state):
+    config = make_config(compliance={"require_footer": False,
+                                     "precleared": {"enabled": True, "sender_country": "GB"}})
+    pid = await jane(state)
+    await queue(state, pid)
+    await queue_reply(state)
+    calls = []
+    provider = RecordingProvider()
+    sender = with_check(make_config_sender(state, config, provider),
+                        mock_precleared(calls, OK_BODY))
+
+    await cycles(sender)
+
+    assert [m["to"] for m in provider.sent] == [REPLY]
+    assert calls == []
+    assert [i["to_email"] for i in await state.get_outbox(status="approved")] == [JANE]
 
 
 # ── check unavailable: cold email waits, replies go ──
@@ -564,7 +1059,7 @@ async def test_daily_limit_holds_cold_email_but_replies_still_go(state):
 
     await sender._drain_due()
 
-    # One failed call pauses fresh checks for the rest of the cycle.
+    # The allowance isn't about one address, so no more checks this cycle.
     assert len(calls) == 1
     assert [m["to"] for m in provider.sent] == [REPLY]
     assert await state.get_outbox(status="failed") == []
@@ -572,6 +1067,57 @@ async def test_daily_limit_holds_cold_email_but_replies_still_go(state):
     assert sorted(i["to_email"] for i in waiting) == [JANE, SAM]
     # Nothing cached, so the next cycle asks again.
     assert await state.get_setting(SETTINGS_PREFIX + JANE) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body,api_key", [
+    (429, {"error": "rate_limited", "retry_after": 20}, "pc_live_test"),
+    (402, {"error": "payment_required"}, "pc_live_test"),
+    (401, {"error": "invalid_key"}, "pc_live_test"),
+], ids=["rate-limit", "no-checks-left", "rejected-key"])
+async def test_failure_not_about_the_address_stops_checks_for_the_cycle(state, status, body, api_key):
+    first = await jane(state)
+    second = await seed_prospect(state, email=SAM)
+    await queue(state, first)
+    await queue(state, second, to=SAM)
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content)["recipient_email"])
+        return httpx.Response(status, json=body)
+
+    sender = with_check(make_sender(state, FakeProvider()), httpx.MockTransport(handler),
+                        api_key=api_key)
+    await sender._drain_due()
+
+    assert calls == [JANE]
+    assert len(await state.get_outbox(status="approved")) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 500, 503])
+async def test_one_refused_address_does_not_hold_up_the_others(state, status):
+    poison = "poison@example.com"
+    first = await seed_prospect(state, email=poison)
+    second = await seed_prospect(state, email=SAM)
+    await queue(state, first, to=poison)
+    await queue(state, second, to=SAM)
+    calls = []
+
+    def handler(request):
+        email = json.loads(request.content)["recipient_email"]
+        calls.append(email)
+        if email == poison:
+            return httpx.Response(status, json={"error": "invalid_request"})
+        return httpx.Response(200, json=OK_BODY)
+
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), httpx.MockTransport(handler))
+    await cycles(sender)
+
+    assert [m["to"] for m in provider.sent] == [SAM]
+    assert [i["to_email"] for i in await state.get_outbox(status="approved")] == [poison]
+    assert calls == [poison, SAM, poison]
 
 
 @pytest.mark.asyncio
@@ -600,8 +1146,7 @@ async def test_held_cold_backlog_does_not_starve_replies(state):
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), mock_precleared([], status=429))
 
-    await sender._drain_due()
-    await sender._drain_due()
+    await cycles(sender)
 
     assert [m["to"] for m in provider.sent] == [REPLY]
     assert len(await state.get_outbox(status="approved")) == 24
@@ -609,23 +1154,30 @@ async def test_held_cold_backlog_does_not_starve_replies(state):
 
 
 @pytest.mark.asyncio
-async def test_network_error_holds_the_email_and_hides_the_key(state):
-    pid = await jane(state)
-    await queue(state, pid)
+async def test_network_error_holds_the_email_hides_the_key_and_stops_checks(state):
+    first = await jane(state)
+    second = await seed_prospect(state, email=SAM)
+    await queue(state, first)
+    await queue(state, second, to=SAM)
+    calls = []
 
     def boom(request):
+        calls.append(1)
         raise httpx.ConnectError("no route to host for pc_live_secret123")
 
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), httpx.MockTransport(boom),
                         api_key="pc_live_secret123")
     result = await sender.precleared.check(JANE, state)
+    calls.clear()
     await sender._drain_due()
 
-    assert result.held and "pc_live_secret123" not in result.reason
+    assert result.held and result.pause_checks
+    assert "pc_live_secret123" not in result.reason
+    assert len(calls) == 1
     assert provider.sent == []
     assert await state.get_outbox(status="failed") == []
-    assert len(await state.get_outbox(status="approved")) == 1
+    assert len(await state.get_outbox(status="approved")) == 2
 
 
 @pytest.mark.asyncio
@@ -635,10 +1187,38 @@ async def test_server_error_holds_and_hides_the_key(state):
 
     result = await client.clear("person@example.com", state)
 
-    assert result.held and not result.allowed
+    assert result.held and not result.allowed and not result.pause_checks
     assert "HTTP 503" in result.reason
     assert "pc_live_secret123" not in result.reason
     assert await state.get_setting(SETTINGS_PREFIX + "person@example.com") == ""
+
+
+@pytest.mark.asyncio
+async def test_server_error_hides_a_key_cut_off_at_the_limit(state):
+    key = "pc_live_secret123"
+    client = PreclearedClient("GB", api_key=key, transport=mock_raw(
+        500, ("x" * 190 + key).encode()))
+
+    result = await client.clear("person@example.com", state)
+
+    assert result.held
+    assert "pc_live" not in result.reason
+
+
+@pytest.mark.asyncio
+async def test_an_answer_that_never_finishes_holds_cold_email(state, monkeypatch):
+    import franco.integrations.precleared as precleared
+
+    monkeypatch.setattr(precleared, "TOTAL_TIMEOUT", 0.05)
+
+    async def trickle(request):
+        await asyncio.sleep(2)
+        return httpx.Response(200, json=OK_BODY)
+
+    result = await PreclearedClient("GB", transport=httpx.MockTransport(trickle)).clear(JANE, state)
+
+    assert result.held and not result.allowed and result.pause_checks
+    assert "too long" in result.reason
 
 
 @pytest.mark.asyncio
@@ -677,10 +1257,24 @@ async def test_unexpected_error_holds_cold_email_instead_of_stopping_the_cycle(s
 
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), httpx.MockTransport(broken))
-    await sender._drain_due()
+    await cycles(sender)
 
     assert [m["to"] for m in provider.sent] == [REPLY]
     assert [i["to_email"] for i in await state.get_outbox(status="approved")] == [JANE]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_reason_hides_the_key(state):
+    def broken(request):
+        raise RuntimeError("bad state near pc_live_secret123")
+
+    client = PreclearedClient("GB", api_key="pc_live_secret123",
+                              transport=httpx.MockTransport(broken))
+    result = await client.clear(JANE, state)
+
+    assert result.held and not result.pause_checks
+    assert "RuntimeError" in result.reason
+    assert "pc_live_secret123" not in result.reason
 
 
 @pytest.mark.asyncio
@@ -717,7 +1311,7 @@ async def test_held_cold_email_goes_out_once_the_check_answers(state):
     assert len(await state.get_outbox(status="approved")) == 2
 
     sender.precleared._transport = mock_status(200, OK_BODY)
-    await sender._drain_due()
+    await cycles(sender)
     assert sorted(m["to"] for m in provider.sent) == [JANE, SAM]
     assert await state.get_outbox(status="approved") == []
 
@@ -733,20 +1327,21 @@ async def test_keyless_daily_limit_points_to_a_free_key(state):
 
     result = await client.clear("person@example.com", state)
 
-    assert result.held and not result.allowed
+    assert result.held and not result.allowed and result.pause_checks
     assert "add PRECLEARED_API_KEY" in result.reason
     assert "precleared.dev/get-key" in result.reason
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_on_a_key_is_not_reported_as_a_missing_key(state):
-    client = PreclearedClient("GB", api_key="pc_live_test", transport=mock_status(429, {
+@pytest.mark.parametrize("api_key", ["pc_live_test", ""], ids=["with-key", "without-key"])
+async def test_rate_limit_is_not_reported_as_a_used_up_allowance(state, api_key):
+    client = PreclearedClient("GB", api_key=api_key, transport=mock_status(429, {
         "error": "rate_limited", "message": "Slow down.", "retry_after": 20,
     }))
 
     result = await client.clear("person@example.com", state)
 
-    assert result.held and not result.allowed
+    assert result.held and not result.allowed and result.pause_checks
     assert "rate limit" in result.reason
     assert "add PRECLEARED_API_KEY" not in result.reason
 
@@ -759,7 +1354,7 @@ async def test_rejected_key_holds_with_a_clear_reason(state):
 
     result = await client.clear("person@example.com", state)
 
-    assert result.held
+    assert result.held and result.pause_checks
     assert "PRECLEARED_API_KEY was rejected" in result.reason
 
 
@@ -773,7 +1368,7 @@ async def test_key_out_of_checks_points_to_the_buy_page_not_a_free_key(state):
 
     result = await client.clear("person@example.com", state)
 
-    assert result.held and not result.allowed
+    assert result.held and not result.allowed and result.pause_checks
     assert BUY_URL in result.reason
     assert "add PRECLEARED_API_KEY" not in result.reason
     # Franco's own wording and link, never text or links from the answer.
