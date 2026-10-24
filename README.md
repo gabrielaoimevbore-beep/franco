@@ -463,7 +463,8 @@ outreach:    { mode: generated | templates | raad, campaigns, benefits, funnels,
                timezone, send_hour, observation_max_age_days, preview_accounts,
                first_email_max_words, reply_templates }
 compliance:  { require_footer, postal_address, footer, unsubscribe_url,
-               blocked_claims, send_opt_out_ack, opt_out_ack }
+               blocked_claims, send_opt_out_ack, opt_out_ack,
+               precleared: { enabled, sender_country, address_source, prospect_country } }
 usage:       { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
 brain:       { provider: claude | codex, model, reasoning_effort }
 ```
@@ -529,6 +530,7 @@ Franco automates outreach, but **you are the sender.**
 
 - **CAN-SPAM.** Every email needs a truthful subject, an accurate from address, a working opt-out that is honored quickly, and a physical postal address. In every mode, Franco adds the footer to cold email and the gate refuses cold email without it. The template `franco.yaml` ships with `require_footer: true` and a blank address, so **no cold email sends until you enter your own postal address**.
 - **GDPR / PECR.** B2B email needs a legitimate interest you can defend: the message is relevant to the person's role, you know where the data came from, and objecting is easy. Imported accounts carry the source of their observation for exactly this reason.
+- **Per-recipient check (optional).** Those rules turn on facts the address doesn't show: a UK sole trader needs consent where a limited company doesn't, Germany wants prior consent even for business email, and Canada's CASL depends on whether the address was published. With `compliance.precleared.enabled: true`, Franco asks [Precleared](https://precleared.dev), a third-party service, about each new recipient before the first cold email. Anything but `ok_to_email` stops that email, with the rule and the next step under *Didn't send* in the Outbox, and the signed receipt id is logged with each send. One check per address, cached for 30 days and redone if anything sent with it changes. Replies are never checked, and only Gmail and SMTP sends are covered. If Precleared can't be asked, cold email that needs a check waits for a later cycle and replies still go out. Precleared receives the address, your sender country, the address source, the first 200 characters of your product description and, if set, `prospect_country` (used only when it can't tell the recipient's country). Without a key it allows a few checks a day; a free key (`PRECLEARED_API_KEY`) raises that, and beyond the free allowance checks are paid ([pricing](https://precleared.dev/buy)).
 - **Honesty.** If someone asks whether they are talking to an automated system, Franco says yes.
 - **LinkedIn.** Automating LinkedIn violates its terms of service. LinkedIn is off by default.
 
@@ -591,6 +593,7 @@ A database trigger rejects any signal code that isn't in the governed `signal_co
 - **Staged, but nothing sends**: the campaign is probably still in preview. Run `franco preview`, then `franco preview signoff KEY --by NAME`.
 - **Raad mode writes nothing**: run `franco funnels`. Companies may match no funnel, may have no verified contact, or Franco may have nothing sourced to cite. `franco funnels --company DOMAIN` shows what it knows about one company.
 - **Cold email held**: `compliance.postal_address` is blank while `require_footer` is on.
+- **Cold email held, log says the compliance check is unavailable**: Precleared couldn't be asked (daily allowance used up, network, a rejected key). The log line gives the reason; cold email goes out once a check succeeds, and replies are unaffected.
 - **Nothing sends**: check `franco sending`, quiet hours, the daily cap and `franco gmail test`.
 - **Emails land in spam**: almost always a domain problem, not the copy. Check SPF, DKIM and DMARC, warmup and volume.
 
