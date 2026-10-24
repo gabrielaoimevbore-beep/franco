@@ -7,6 +7,19 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **Optional per-recipient compliance check (Precleared).** Set `compliance.precleared.enabled: true` with your `sender_country` (GB, US or AE) and Franco asks [Precleared](https://precleared.dev) about each new recipient before the first cold email: may cold marketing email go to this address under the rules of the recipient's country (UK PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and others)?
+  - Any verdict but `ok_to_email` fails that outbox item, with the rule and the next step as the reason. Follow-ups to that person are then cancelled like any other stopped sequence.
+  - One check per address, cached for 30 days and redone if anything sent with it changes (sender country, address source, product description, prospect country). The signed receipt id is logged with each send.
+  - The check runs only after the pre-send gate passes, so a refused email costs no check. A check can take seconds, so the kill switch, the email's status, the sequence checks (suppression, replies, sign-off) and the gate run again on fresh data before anything is sent. Replies are never checked.
+  - If the check can't be made (daily allowance used up, rate limit, network down, a rejected key, a malformed answer), cold email that needs a fresh check waits for a later cycle; email whose verdict is already cached still goes, and so do replies. Fresh checks per cycle are capped at the cycle's send budget.
+  - Native providers (Gmail, SMTP) only; Franco logs a warning if the check is on while sending through Instantly. Off by default. An optional `PRECLEARED_API_KEY` raises the daily allowance.
+
+### Fixed
+
+- Due replies are fetched on their own when the outbox drains, so a backlog of held cold email (a missing postal address, follow-ups waiting for their step, an unavailable compliance check) can no longer push them off the page and delay them.
+
 ## [0.5.1] — 2026-10-17
 
 ### Security
