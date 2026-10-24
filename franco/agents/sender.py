@@ -21,6 +21,7 @@ from franco.config import FrancoConfig, EnvConfig
 from franco.gate import pre_send_check
 from franco.integrations.instantly import InstantlyClient
 from franco.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from franco.integrations.precleared import PreclearedClient
 from franco.outreach import (
     add_business_days, build_footer, compliance_problem, local_date,
     send_at_utc, unsubscribe_headers, with_footer,
@@ -73,6 +74,14 @@ class Sender:
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
+        # Optional per-recipient check (compliance.precleared); None when off.
+        self.precleared = PreclearedClient.from_config(config, env)
+        if (self.precleared is not None and not self.is_native
+                and getattr(config.channels.email, "enabled", True)):
+            logger.warning(
+                "Sender: compliance.precleared checks native sends only "
+                "(gmail, smtp); campaigns deployed to Instantly are not checked."
+            )
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
 
@@ -517,6 +526,21 @@ class Sender:
         due = await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3
         )
+        # Held cold email (an unavailable compliance check, a missing postal
+        # address, a follow-up waiting for its step) stays approved and could
+        # fill the page above, so replies are also fetched on their own and
+        # never wait behind it. Bounded: one extra query of the same size.
+        seen = {item["id"] for item in due}
+        replies = await self.state.get_outbox(
+            status="approved", due_before=now, limit=budget * 3,
+            exclude_kind="sequence",
+        )
+        extra = [item for item in replies if item["id"] not in seen]
+        if extra:
+            due = sorted(
+                due + extra,
+                key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
+            )
         if not due:
             return
         self._signoff_cache = {}   # sign-off can change between cycles
@@ -532,6 +556,12 @@ class Sender:
         # One step per person per cycle: sending step 1 re-times step 2 to a
         # later business day, but step 2's stale row may still be in `due`.
         sent_sequences: set[tuple[str, str]] = set()
+        # Optional compliance check (compliance.precleared). Once Precleared
+        # can't be asked (allowance used up, network), cold email that needs
+        # a fresh check waits for a later cycle; replies still go out. Fresh
+        # checks are capped per cycle so slow answers can't stall the cycle.
+        compliance_paused = False
+        fresh_checks = 0
         for item in due:
             if sent >= budget:
                 break
@@ -573,6 +603,55 @@ class Sender:
                     f"{gate.reasons}"
                 )
                 continue
+
+            # One check per address, before the first cold email, and only
+            # for email the gate has passed. Replies are never checked.
+            receipt_id = ""
+            if self.precleared is not None and item["kind"] == "sequence":
+                clearance = await self.precleared.cached(item["to_email"], self.state)
+                if clearance is None:
+                    if compliance_paused or fresh_checks >= budget:
+                        continue  # asked on a later cycle
+                    fresh_checks += 1
+                    clearance = await self.precleared.check(item["to_email"], self.state)
+                    if clearance.held:
+                        compliance_paused = True
+                        logger.warning(
+                            "Sender: compliance check unavailable, holding cold "
+                            f"email until a later cycle: {clearance.reason}"
+                        )
+                        continue
+                    # A check can take seconds, and anything may change
+                    # meanwhile (a rejection, a suppression, a reply, the kill
+                    # switch), so Franco's own checks run again on fresh data.
+                    # If one now stops the email, the next cycle records why;
+                    # the verdict is kept, so that costs no second check.
+                    if await self.state.get_setting(KILL_SWITCH_KEY):
+                        logger.warning("Sender: sending was paused during the cycle; stopping.")
+                        break
+                    fresh = await self.state.get_outbox_item(item["id"])
+                    prospect = await self.state.get_prospect(item["prospect_id"])
+                    if (fresh is None or fresh["status"] != "approved" or prospect is None
+                            or await self._sequence_hold(fresh, prospect)
+                            or not pre_send_check(
+                                fresh["to_email"], fresh["subject"], fresh["body"],
+                                prospect=prospect, allow_risky=allow_risky,
+                                kind=fresh["kind"], required_footer=footer,
+                                blocked_phrases=blocked_claims,
+                            )):
+                        continue
+                    item = fresh
+                if not clearance.allowed:
+                    await self.state.update_outbox_item(
+                        item["id"], status="failed",
+                        error=f"precleared: {clearance.verdict}: {clearance.reason}"[:300],
+                    )
+                    logger.warning(
+                        f"Sender: Precleared stopped email to {item['to_email']}: "
+                        f"{clearance.verdict} ({clearance.reason})"
+                    )
+                    continue
+                receipt_id = clearance.receipt_id
 
             send_kwargs = {
                 "thread_ref": item.get("thread_ref", ""),
@@ -618,13 +697,16 @@ class Sender:
                         )
                 except Exception as e:
                     logger.debug(f"Sender: convo append failed: {e}")
+            details = {
+                "to": item["to_email"], "step": item["step"],
+                "kind": item["kind"], "provider": self.provider.name,
+            }
+            if receipt_id:
+                details["precleared_receipt"] = receipt_id
             await self.state.log_action(
                 action_type="email_sent",
                 agent="sender",
-                details={
-                    "to": item["to_email"], "step": item["step"],
-                    "kind": item["kind"], "provider": self.provider.name,
-                },
+                details=details,
             )
             logger.info(
                 f"Sender: sent step {item['step']} to {item['to_email']} "
